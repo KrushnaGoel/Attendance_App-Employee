@@ -11,7 +11,6 @@ class EmployeeDashboard extends StatefulWidget {
   @override
   _EmployeeDashboardState createState() => _EmployeeDashboardState();
 }
-
 class _EmployeeDashboardState extends State<EmployeeDashboard> {
   final User? user = FirebaseAuth.instance.currentUser;
   late String userEmail;
@@ -23,6 +22,7 @@ class _EmployeeDashboardState extends State<EmployeeDashboard> {
   String _statusMessage = 'Checking location...';
   double _distanceFromOffice = 0.0;
   Duration _timeInOffice = Duration(seconds: 0);
+
   Timer? _timer;
   Location _location = Location();
 
@@ -31,6 +31,7 @@ class _EmployeeDashboardState extends State<EmployeeDashboard> {
     super.initState();
     userEmail = user?.email?.toLowerCase() ?? '';
     _fetchManagerDetails();
+    _fetchInitialAttendanceData(); // Fetch totalWorkDuration once
   }
 
   Future<void> _fetchManagerDetails() async {
@@ -54,13 +55,11 @@ class _EmployeeDashboardState extends State<EmployeeDashboard> {
           proximity = (managerDoc['proximity'] as num).toDouble();
           _startLocationTracking();
         } else {
-          // Manager document does not exist
           setState(() {
             _statusMessage = 'Manager details not found.';
           });
         }
       } else {
-        // Employee document does not exist
         setState(() {
           _statusMessage = 'Employee details not found.';
         });
@@ -73,7 +72,39 @@ class _EmployeeDashboardState extends State<EmployeeDashboard> {
     }
   }
 
-  Future<void> _startLocationTracking() async {
+  Future<void> _fetchInitialAttendanceData() async {
+    String date = DateFormat('yyyy-MM-dd').format(DateTime.now());
+    String documentId = '$userEmail\_$date';
+
+    try {
+      DocumentSnapshot attendanceDoc = await FirebaseFirestore.instance
+          .collection('attendance')
+          .doc(documentId)
+          .get();
+
+      if (attendanceDoc.exists) {
+        Map<String, dynamic> data =
+            attendanceDoc.data() as Map<String, dynamic>;
+        double totalWorkDuration =
+            (data['totalWorkDuration'] as num?)?.toDouble() ?? 0.0;
+        setState(() {
+          _timeInOffice = Duration(
+              milliseconds: (totalWorkDuration * 3600 * 1000).toInt());
+        });
+      } else {
+        setState(() {
+          _timeInOffice = Duration(seconds: 0);
+        });
+      }
+    } catch (e) {
+      print('Error fetching initial attendance data: $e');
+      setState(() {
+        _timeInOffice = Duration(seconds: 0);
+      });
+    }
+  }
+
+  void _startLocationTracking() async {
     // Request permissions
     bool _serviceEnabled;
     PermissionStatus _permissionGranted;
@@ -157,6 +188,7 @@ class _EmployeeDashboardState extends State<EmployeeDashboard> {
 
   void _stopTimer() {
     _timer?.cancel();
+    _timer = null;
   }
 
   Future<void> _updateAttendanceStatus(bool isInOffice) async {
@@ -169,22 +201,36 @@ class _EmployeeDashboardState extends State<EmployeeDashboard> {
 
     if (isInOffice) {
       // Employee just entered the office
-      // Update or create attendance record
-      await attendanceDoc.set({
-        'employeeEmail': userEmail,
-        'date': date,
-        'managerEmail': managerEmail,
-        'inOutTimes': FieldValue.arrayUnion([
-          {'inTime': Timestamp.now(), 'outTime': null}
-        ]),
-        //'totalWorkDuration': 0.0,
-      }, SetOptions(merge: true));
+      // Check if attendance record exists
+      DocumentSnapshot docSnapshot = await attendanceDoc.get();
+
+      if (docSnapshot.exists) {
+        // Attendance record exists, update it without resetting totalWorkDuration
+        await attendanceDoc.update({
+          'inOutTimes': FieldValue.arrayUnion([
+            {'inTime': Timestamp.now(), 'outTime': null}
+          ]),
+        });
+      } else {
+        // Attendance record does not exist, create it with totalWorkDuration as current _timeInOffice
+        await attendanceDoc.set({
+          'employeeEmail': userEmail,
+          'date': date,
+          'managerEmail': managerEmail,
+          'inOutTimes': [
+            {'inTime': Timestamp.now(), 'outTime': null}
+          ],
+          'totalWorkDuration': _timeInOffice.inSeconds / 3600.0, // Convert to hours
+        });
+      }
     } else {
       // Employee just left the office
       // Update the last inOutTime entry with outTime
       DocumentSnapshot docSnapshot = await attendanceDoc.get();
       if (docSnapshot.exists) {
-        List<dynamic> inOutTimes = docSnapshot['inOutTimes'] ?? [];
+        Map<String, dynamic> data =
+            docSnapshot.data() as Map<String, dynamic>;
+        List<dynamic> inOutTimes = List.from(data['inOutTimes'] ?? []);
         if (inOutTimes.isNotEmpty) {
           // Find the last entry with null outTime
           for (int i = inOutTimes.length - 1; i >= 0; i--) {
@@ -194,11 +240,19 @@ class _EmployeeDashboardState extends State<EmployeeDashboard> {
               // Calculate duration
               Timestamp inTimestamp = inOutTimes[i]['inTime'];
               Timestamp outTimestamp = inOutTimes[i]['outTime'];
-              Duration duration = outTimestamp.toDate().difference(inTimestamp.toDate());
+              Duration duration =
+                  outTimestamp.toDate().difference(inTimestamp.toDate());
 
               // Update totalWorkDuration
-              double totalWorkDuration = (docSnapshot['totalWorkDuration'] as num?)?.toDouble() ?? 0.0;
+              double totalWorkDuration =
+                  (data['totalWorkDuration'] as num?)?.toDouble() ?? 0.0;
               totalWorkDuration += duration.inSeconds / 3600.0; // Convert to hours
+
+              // Update _timeInOffice with the new totalWorkDuration
+              setState(() {
+                _timeInOffice = Duration(
+                    milliseconds: (totalWorkDuration * 3600 * 1000).toInt());
+              });
 
               await attendanceDoc.update({
                 'inOutTimes': inOutTimes,
@@ -213,8 +267,13 @@ class _EmployeeDashboardState extends State<EmployeeDashboard> {
   }
 
   Future<void> _signOut(BuildContext context) async {
-    _updateAttendanceStatus(false);
+    _stopTimer();
+    // Since we don't have a reference to the location subscription, it will be cleaned up on dispose.
+
+    await _updateAttendanceStatus(false);
+
     await FirebaseAuth.instance.signOut();
+
     Navigator.pushNamedAndRemoveUntil(
       context,
       Routes.login,
@@ -238,7 +297,7 @@ class _EmployeeDashboardState extends State<EmployeeDashboard> {
 
   @override
   Widget build(BuildContext context) {
-    String userName = user?.displayName??"No Name";
+    String userEmail = user?.email ?? 'No Email';
 
     return Scaffold(
       appBar: AppBar(
@@ -255,7 +314,7 @@ class _EmployeeDashboardState extends State<EmployeeDashboard> {
         child: Column(
           children: [
             Text(
-              'Welcome, $userName',
+              'Welcome, $userEmail',
               style: TextStyle(fontSize: 18),
             ),
             SizedBox(height: 20),
